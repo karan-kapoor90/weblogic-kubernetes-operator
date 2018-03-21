@@ -719,17 +719,12 @@ public class PodHelper {
 
     @Override
     public NextAction apply(Packet packet) {
-      DomainPresenceInfo info = packet.getSPI(DomainPresenceInfo.class);
-      
-      Domain dom = info.getDomain();
-      V1ObjectMeta meta = dom.getMetadata();
-      String namespace = meta.getNamespace();
-      
       V1DeleteOptions deleteOptions = new V1DeleteOptions();
       // Set pod to null so that watcher doesn't try to recreate pod
       V1Pod oldPod = sko.getPod().getAndSet(null);
       if (oldPod != null) {
-        return doNext(CallBuilder.create().deletePodAsync(oldPod.getMetadata().getName(), namespace, deleteOptions, new ResponseStep<V1Status>(next) {
+        V1ObjectMeta meta = oldPod.getMetadata();
+        return doNext(CallBuilder.create().deletePodAsync(meta.getName(), meta.getNamespace(), deleteOptions, new ResponseStep<V1Status>(next) {
           @Override
           public NextAction onFailure(Packet packet, ApiException e, int statusCode,
               Map<String, List<String>> responseHeaders) {

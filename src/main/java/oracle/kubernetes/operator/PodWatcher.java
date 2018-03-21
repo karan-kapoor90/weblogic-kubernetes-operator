@@ -36,9 +36,8 @@ public class PodWatcher extends Watcher<V1Pod> implements WatchListener<V1Pod> {
   private final String ns;
   private final WatchListener<V1Pod> listener;
 
-  // Map of Pod name to OnReady
   private final ConcurrentMap<String, OnReady> readyCallbackRegistrations = new ConcurrentHashMap<>();
-  
+  private final ConcurrentMap<String, OnDelete> deleteCallbackRegistrations = new ConcurrentHashMap<>();
   /**
    * Factory for PodWatcher
    * @param ns Namespace
@@ -70,12 +69,14 @@ public class PodWatcher extends Watcher<V1Pod> implements WatchListener<V1Pod> {
   public void receivedResponse(Watch.Response<V1Pod> item) {
     LOGGER.entering();
     
+    V1Pod pod;
+    String podName;
     switch(item.type) {
     case "ADDED":
     case "MODIFIED":
-      V1Pod pod = item.object;
+      pod = item.object;
       Boolean isReady = isReady(pod);
-      String podName = pod.getMetadata().getName();
+      podName = pod.getMetadata().getName();
       if (isReady) {
         OnReady ready = readyCallbackRegistrations.remove(podName);
         if (ready != null) {
@@ -84,6 +85,14 @@ public class PodWatcher extends Watcher<V1Pod> implements WatchListener<V1Pod> {
       }
       break;
     case "DELETED":
+      pod = item.object;
+      podName = pod.getMetadata().getName();
+      LOGGER.info(MessageKeys.POD_IS_DELETED, pod.getMetadata().getName());
+      OnDelete delete = deleteCallbackRegistrations.remove(podName);
+      if (delete != null) {
+        delete.onDelete();
+      }
+      break;
     case "ERROR":
     default:
     }
@@ -211,5 +220,73 @@ public class PodWatcher extends Watcher<V1Pod> implements WatchListener<V1Pod> {
   @FunctionalInterface
   private interface OnReady {
     void onReady();
+  }
+
+  /**
+   * Waits until the Pod is deleted
+   * @param pod Pod to watch
+   * @param next Next processing step once Pod is deleted
+   * @return Asynchronous step
+   */
+  public Step waitForDelete(V1Pod pod, Step next) {
+    return new WaitForPodDeleteStep(pod, next);
+  }
+  
+  private class WaitForPodDeleteStep extends Step {
+    private final V1Pod pod;
+
+    private WaitForPodDeleteStep(V1Pod pod, Step next) {
+      super(next);
+      this.pod = pod;
+    }
+
+    @Override
+    public NextAction apply(Packet packet) {
+      if (isReady(pod)) {
+        return doNext(packet);
+      }
+      
+      V1ObjectMeta metadata = pod.getMetadata();
+      
+      LOGGER.info(MessageKeys.WAITING_FOR_POD_DELETE, metadata.getName());
+      
+      AtomicBoolean didResume = new AtomicBoolean(false);
+      return doSuspend((fiber) -> {
+        OnDelete delete = () -> {
+          if (didResume.compareAndSet(false, true)) {
+            fiber.resume(packet);
+          }
+        };
+        deleteCallbackRegistrations.put(metadata.getName(), delete);
+
+        // Timing window -- pod may have been deleted before registration for callback
+        fiber.createChildFiber().start(CallBuilder.create().readPodAsync(
+            metadata.getName(), metadata.getNamespace(), new ResponseStep<V1Pod>(null) {
+              @Override
+              public NextAction onFailure(Packet packet, ApiException e, int statusCode,
+                  Map<String, List<String>> responseHeaders) {
+                if (statusCode == CallBuilder.NOT_FOUND) {
+                  if (didResume.compareAndSet(false, true)) {
+                    deleteCallbackRegistrations.remove(metadata.getName(), delete);
+                    fiber.resume(packet);
+                  }
+                  return onSuccess(packet, null, statusCode, responseHeaders);
+                }
+                return super.onFailure(packet, e, statusCode, responseHeaders);
+              }
+
+              @Override
+              public NextAction onSuccess(Packet packet, V1Pod result, int statusCode,
+                  Map<String, List<String>> responseHeaders) {
+                return doNext(packet);
+              }
+        }), packet.clone(), null);
+      });
+    }
+  }
+  
+  @FunctionalInterface
+  private interface OnDelete {
+    void onDelete();
   }
 }

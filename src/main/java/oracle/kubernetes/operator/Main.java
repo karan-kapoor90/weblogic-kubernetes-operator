@@ -1202,7 +1202,15 @@ public class Main {
 
     @Override
     public NextAction apply(Packet packet) {
-      return doNext(PodHelper.deletePodStep(sko, new ServerDownFinalizeStep(serverName, next)), packet);
+      Step finalizeStep = new ServerDownFinalizeStep(serverName, next);
+      V1Pod pod = sko.getPod().get();
+      if (pod != null) {
+        String namespace = pod.getMetadata().getNamespace();
+        PodWatcher pw = podWatchers.get(namespace);
+        return doNext(PodHelper.deletePodStep(sko, 
+            pw.waitForDelete(pod, finalizeStep)), packet);
+      }
+      return doNext(finalizeStep, packet);
     }
   }
   
@@ -1244,9 +1252,9 @@ public class Main {
   private static void deleteDomainPresence(String namespace, String domainUID) {
     LOGGER.entering();
 
-    domains.remove(domainUID);
+    DomainPresenceInfo info = domains.remove(domainUID);
 
-    domainUpdaters.startFiber(domainUID, new DeleteDomainStep(namespace, domainUID), new Packet(), new CompletionCallback() {
+    domainUpdaters.startFiber(domainUID, new DeleteDomainStep(info, namespace, domainUID), new Packet(), new CompletionCallback() {
       @Override
       public void onCompletion(Packet packet) {
         // no-op
@@ -1262,10 +1270,42 @@ public class Main {
   }
   
   private static class DeleteDomainStep extends Step {
+    private final DomainPresenceInfo info;
+
+    public DeleteDomainStep(DomainPresenceInfo info, String namespace, String domainUID) {
+      super(new FinalDeleteDomainStep(namespace, domainUID));
+      this.info = info;
+    }
+
+    @Override
+    public NextAction apply(Packet packet) {
+      if (info != null) {
+        Domain dom = info.getDomain();
+        DomainSpec spec = dom.getSpec();
+  
+        String adminName = spec.getAsName();
+        Map<String, ServerKubernetesObjects> currentServers = info.getServers();
+        Collection<Map.Entry<String, ServerKubernetesObjects>> serversToStop = new ArrayList<>();
+        for(Map.Entry<String, ServerKubernetesObjects> entry : currentServers.entrySet()) {
+          if (!entry.getKey().equals(adminName)) {
+            serversToStop.add(entry);
+          }
+        }
+        
+        if (!serversToStop.isEmpty()) {
+          return doNext(new ServerDownIteratorStep(serversToStop, next), packet);
+        }
+      }
+
+      return doNext(packet);
+    }
+  }
+  
+  private static class FinalDeleteDomainStep extends Step {
     private final String namespace;
     private final String domainUID;
 
-    public DeleteDomainStep(String namespace, String domainUID) {
+    public FinalDeleteDomainStep(String namespace, String domainUID) {
       super(null);
       this.namespace = namespace;
       this.domainUID = domainUID;
